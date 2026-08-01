@@ -1,0 +1,337 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
+
+// Use service role for user creation
+const supabaseAdmin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+)
+
+export async function GET(req: NextRequest) {
+  // Lookup invitation by token (for pre-filling the form)
+  const token = req.nextUrl.searchParams.get('token')
+  if (!token) {
+    return NextResponse.json({ error: 'Missing token' }, { status: 400 })
+  }
+
+  const { data: invitation, error } = await supabaseAdmin
+    .from('invitations')
+    .select('id, email, workspace_id, status, expires_at, invite_type, group_ids, workspaces(name)')
+    .eq('token', token)
+    .maybeSingle()
+
+  if (error || !invitation) {
+    return NextResponse.json({ error: 'Invalid invitation' }, { status: 404 })
+  }
+
+  if (invitation.status !== 'pending' && invitation.status !== 'expired') {
+    return NextResponse.json({ error: 'This invitation has already been used' }, { status: 410 })
+  }
+
+  // Check if workspace already has project details (from the founder/owner)
+  const { data: members } = await supabaseAdmin
+    .from('workspace_members')
+    .select('user_id')
+    .eq('workspace_id', invitation.workspace_id)
+  
+  let hasProjectDetails = false
+  if (members && members.length > 0) {
+    const userIds = members.map(m => m.user_id)
+    const { data: projDetails } = await supabaseAdmin
+      .from('project_details')
+      .select('id')
+      .in('user_id', userIds)
+      .limit(1)
+    
+    if (projDetails && projDetails.length > 0) {
+      hasProjectDetails = true
+    }
+  }
+
+  // For group admin invites, get the group names
+  let groupNames: string[] = []
+  if (invitation.invite_type === 'group_admin' && invitation.group_ids?.length > 0) {
+    const { data: groupData } = await supabaseAdmin
+      .from('workspace_groups')
+      .select('name')
+      .in('id', invitation.group_ids)
+    if (groupData) {
+      groupNames = groupData.map((g: any) => g.name)
+    }
+  }
+
+  return NextResponse.json({
+    email: invitation.email,
+    workspaceName: (invitation.workspaces as any)?.name || (groupNames.length > 0 ? groupNames.join(', ') : 'ThinkSoul'),
+    workspaceId: invitation.workspace_id,
+    inviteType: invitation.invite_type || 'workspace_member',
+    groupIds: invitation.group_ids || [],
+    groupNames,
+    hasProjectDetails,
+  })
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json()
+    const {
+      token,
+      password,
+      fullName,
+      displayName,
+      phone,
+      aboutMe,
+      projectName,
+      projectDescription,
+      startDate,
+      currentStage,
+    } = body
+
+    const { autoJoin } = body
+
+    console.log('Registration POST received:', {
+      tokenSnippet: token?.slice(0, 8) + '...',
+      email: body.email, 
+      fullName,
+      autoJoin
+    })
+
+    if (!token || (!autoJoin && (!password || !fullName))) {
+      console.warn('Registration failed: Missing required fields')
+      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+    }
+
+    const cleanToken = token.trim().replace(/\/$/, '')
+    console.log('Searching for invitation with token:', cleanToken)
+
+    // Validate invitation
+    const { data: invitation, error: invError } = await supabaseAdmin
+      .from('invitations')
+      .select('id, email, workspace_id, status, expires_at, invite_type, group_ids')
+      .eq('token', cleanToken)
+      .maybeSingle()
+
+    if (invError || !invitation) {
+      console.error('Invitation lookup failed or not found:', { invError, token: cleanToken })
+      return NextResponse.json({ error: 'Invalid invitation' }, { status: 404 })
+    }
+
+    if (invitation.status !== 'pending' && invitation.status !== 'expired') {
+      return NextResponse.json({ error: 'This invitation has already been used' }, { status: 410 })
+    }
+
+    const email = invitation.email
+
+    // Check if user already exists in auth
+    const { data: existingUsers } = await supabaseAdmin.auth.admin.listUsers()
+    const existingUser = existingUsers?.users?.find(u => u.email === email)
+
+    let userId: string
+
+    if (existingUser) {
+      // User exists in auth — just add them to the workspace
+      userId = existingUser.id
+    } else {
+      // If autoJoin is true but user doesn't exist, we can't auto-join
+      if (autoJoin) {
+        return NextResponse.json({ error: 'User does not exist for auto-join' }, { status: 400 })
+      }
+
+      // Create new auth user
+      const { data: newUser, error: createError } = await supabaseAdmin.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true, // Auto-confirm since they came via invite
+      })
+
+      if (createError || !newUser?.user) {
+        console.error('Create user error:', createError)
+        return NextResponse.json({ error: createError?.message || 'Failed to create user' }, { status: 500 })
+      }
+
+      userId = newUser.user.id
+    }
+
+    // Upsert profile
+    const { error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .upsert({
+        id: userId,
+        email,
+        full_name: fullName || existingUser?.user_metadata?.full_name || email.split('@')[0],
+        display_name: displayName || fullName || existingUser?.user_metadata?.display_name || email.split('@')[0],
+        phone: phone || null,
+        about_me: aboutMe || null,
+      }, { onConflict: 'id' })
+
+    if (profileError) {
+      console.error('Profile upsert error:', profileError)
+    }
+
+    // Add to workspace (for workspace_member invites)
+    if (invitation.workspace_id) {
+      const { error: memberError } = await supabaseAdmin
+        .from('workspace_members')
+        .upsert({
+          workspace_id: invitation.workspace_id,
+          user_id: userId,
+          role: 'member',
+        }, { onConflict: 'workspace_id,user_id' })
+
+      if (memberError) {
+        console.error('Member insert error:', memberError)
+      }
+    }
+
+    // ============================================================
+    // IMPROVED GROUP ADMIN ASSIGNMENT
+    // Key improvements:
+    // - Better validation of group_ids array
+    // - Returns error instead of silently continuing if assignment fails
+    // - Comprehensive logging for debugging
+    // - Blocks registration if group admin assignment fails
+    // ============================================================
+    
+    if (invitation.invite_type === 'group_admin') {
+      console.log(`[Register] 🔍 Processing group_admin invitation for ${email}`)
+      
+      // Parse group_ids safely - handle multiple formats
+      let groupIdsArray: string[] = []
+      
+      if (Array.isArray(invitation.group_ids)) {
+        // If it's already an array, filter for valid strings
+        groupIdsArray = invitation.group_ids.filter(
+          (id) => typeof id === 'string' && id.trim().length > 0
+        )
+        console.log(`[Register] 📋 Parsed array format: ${groupIdsArray.length} groups`)
+      } else if (typeof invitation.group_ids === 'string' && invitation.group_ids.trim().length > 0) {
+        // If it's a single string, wrap in array
+        groupIdsArray = [invitation.group_ids.trim()]
+        console.log(`[Register] 📋 Parsed string format: 1 group`)
+      } else {
+        // No valid group_ids found
+        console.error(
+          `[Register] ❌ CRITICAL: Invalid group_ids in invitation`,
+          { email, group_ids: invitation.group_ids, type: typeof invitation.group_ids }
+        )
+        return NextResponse.json(
+          {
+            error: 'Invalid group_admin invitation',
+            message: 'No valid groups specified for group admin assignment',
+            details: { group_ids: invitation.group_ids }
+          },
+          { status: 400 }
+        )
+      }
+
+      console.log(`[Register] ✅ Validated ${groupIdsArray.length} groups for assignment:`, groupIdsArray)
+
+      // Assign user to each group as admin
+      const groupAssignmentResults: {
+        groupId: string
+        success: boolean
+        error?: string
+      }[] = []
+
+      for (const groupId of groupIdsArray) {
+        try {
+          console.log(`[Register] 🔗 Assigning user ${userId} to group ${groupId}`)
+
+          const { data, error: gaError } = await supabaseAdmin
+            .from('group_admins')
+            .upsert(
+              {
+                group_id: groupId,
+                user_id: userId
+              },
+              {
+                onConflict: 'group_id,user_id'
+              }
+            )
+            .select()
+
+          if (gaError) {
+            console.error(`[Register] ❌ Database error for group ${groupId}:`, {
+              code: gaError.code,
+              message: gaError.message,
+              details: gaError.details
+            })
+            groupAssignmentResults.push({
+              groupId,
+              success: false,
+              error: gaError.message
+            })
+          } else {
+            console.log(`[Register] ✅ Successfully assigned to group ${groupId}`, {
+              rows_affected: data?.length || 0
+            })
+            groupAssignmentResults.push({
+              groupId,
+              success: true
+            })
+          }
+        } catch (assignError) {
+          console.error(`[Register] ❌ Exception while assigning to group ${groupId}:`, assignError)
+          groupAssignmentResults.push({
+            groupId,
+            success: false,
+            error: assignError instanceof Error ? assignError.message : String(assignError)
+          })
+        }
+      }
+
+      // Check if ALL assignments succeeded
+      const successfulAssignments = groupAssignmentResults.filter((r) => r.success)
+      const failedAssignments = groupAssignmentResults.filter((r) => !r.success)
+
+      console.log(`[Register] 📊 Group admin assignment summary:`, {
+        total: groupAssignmentResults.length,
+        successful: successfulAssignments.length,
+        failed: failedAssignments.length
+      })
+
+      // If ANY assignment failed, return error instead of silently continuing
+      if (failedAssignments.length > 0) {
+        console.error(`[Register] ❌ CRITICAL: ${failedAssignments.length} group assignments failed:`, failedAssignments)
+        return NextResponse.json(
+          {
+            error: 'Failed to assign as group admin',
+            message: `Failed to assign to ${failedAssignments.length} group(s)`,
+            failed_groups: failedAssignments
+          },
+          { status: 500 }
+        )
+      }
+
+      console.log(`[Register] ✅ All group admin assignments completed successfully for ${email}`)
+    }
+
+    // Insert project details if provided
+    if (projectName) {
+      const { error: projError } = await supabaseAdmin
+        .from('project_details')
+        .insert({
+          user_id: userId,
+          project_name: projectName,
+          project_description: projectDescription || null,
+          start_date: startDate || null,
+          current_stage: currentStage ? Number(currentStage) : null,
+        })
+
+      if (projError) {
+        console.error('Project details insert error:', projError)
+      }
+    }
+
+    // Mark invitation as accepted
+    await supabaseAdmin
+      .from('invitations')
+      .update({ status: 'accepted' })
+      .eq('id', invitation.id)
+
+    return NextResponse.json({ success: true, message: 'Registration complete! You can now log in.' })
+  } catch (err: any) {
+    console.error('Register API error:', err)
+    return NextResponse.json({ error: err.message || 'Internal server error' }, { status: 500 })
+  }
+}

@@ -1,0 +1,108 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #f2f3f5;
+  --color-foreground: #1f1f1f;
+  --font-sans: var(--font-inter);
+}
+
+/* Scrollbar — thin */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Touch scrolling smooth */
+.touch-scroll {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Custom Scrollbar for modern look */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #e5e7eb;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af;
+}
+
+/* BlockNote editor overrides — clean Notion-like appearance */
+.bn-editor {
+  --bn-colors-editor-background: #ffffff !important;
+  --bn-colors-editor-text: #1f1f1f !important;
+}
+
+.bn-editor-clean .bn-editor {
+  background: transparent !important;
+  font-family: 'Inter', sans-serif !important;
+}
+
+/* Remove default BlockNote border/shadow */
+.bn-editor-clean .bn-container {
+  border: none !important;
+  box-shadow: none !important;
+}
+
+/* Premium Blockquote Styling */
+.bn-editor blockquote {
+  border-left: 4px solid #1a73e8 !important;
+  background: rgba(26, 115, 232, 0.05) !important;
+  padding: 1rem 1.5rem !important;
+  margin: 1.5rem 0 !important;
+  border-radius: 0 0.5rem 0.5rem 0 !important;
+  font-style: italic !important;
+  color: #374151 !important;
+  width: auto !important;
+  display: block !important;
+}
+
+.bn-editor .bn-block[data-type="blockquote"] {
+  width: 100% !important;
+}
+
+/* Anti-aliasing */
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Selection */
+::selection {
+  background: rgba(26, 115, 232, 0.1);
+  color: #1a73e8;
+}
+
+/* Mobile: smooth touch scrolling */
+.touch-scroll-x {
+  -webkit-overflow-scrolling: touch;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+}
+
+/* Mobile: safe-area inset for notched phones */
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Sidebar mobile transition */
+.sidebar-drawer {
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Backdrop fade for mobile sidebar */
+.sidebar-backdrop {
+  transition: opacity 0.25s ease;
+}
